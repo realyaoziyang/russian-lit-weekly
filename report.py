@@ -1,115 +1,155 @@
 # -*- coding: utf-8 -*-
 """
 report.py — 每周俄罗斯文学动态简报生成器
-原理：抓取俄罗斯文化新闻的 RSS 源 → 按文学关键词筛选最近7天的新闻
-      → 生成邮件 → 用163邮箱发给你
+策略：通过 Google 新闻 RSS 搜索，追踪厚杂志、文学机构、奖项、出版社动态
 """
 
 import os
+import re
 import smtplib
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 from email.mime.text import MIMEText
 from email.header import Header
 from email.utils import formataddr
 
+import requests
 import feedparser
 
-# ========== 1. 读取配置（之后从 GitHub 加密保险箱获取）==========
-EMAIL_USER = os.environ["EMAIL_USER"]              # 你的163邮箱地址
-EMAIL_PASSWORD = os.environ["EMAIL_PASSWORD"]      # 163授权码（不是登录密码！）
-EMAIL_TO = os.environ.get("EMAIL_TO", EMAIL_USER)  # 收件人，默认发给自己
+# ========== 1. 读取配置 ==========
+EMAIL_USER = os.environ["EMAIL_USER"]
+EMAIL_PASSWORD = os.environ["EMAIL_PASSWORD"]
+EMAIL_TO = os.environ.get("EMAIL_TO", EMAIL_USER)
 
-# ========== 2. 新闻源（俄罗斯主流文化频道 RSS）==========
-FEEDS = {
-    "俄新社 · 文化": "https://ria.ru/export/rss2/culture/index.xml",
-    "Lenta.ru · 文化": "https://lenta.ru/rss/culture",
-    "Газета.ru · 文化": "https://www.gazeta.ru/rss/culture.xml",
-    "俄罗斯报 · 文化": "https://rg.ru/rss/culture.xml",
+BEIJING = timezone(timedelta(hours=8))
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+MAX_PER_SECTION = 8  # 每个板块最多收录条数
+
+# ========== 2. 信源清单（按你的体系分组，每组一组搜索词）==========
+SECTIONS = {
+    "📖 厚杂志动态": [
+        '"Новый мир" журнал',
+        '"Знамя" литературный журнал',
+        '"Октябрь" журнал литературный',
+        '"Дружба народов" журнал',
+        '"Нева" журнал литературный',
+        '"Москва" журнал Союз писателей',
+    ],
+    "🏛️ 机构与学术": [
+        '"Литературная газета"',
+        '"Союз писателей России"',
+        "ИМЛИ РАН литература",
+        '"Studia Litterarum"',
+    ],
+    "🏆 文学奖项": [
+        '"Большая книга" премия',
+        '"Национальный бестселлер" премия',
+        '"Ясная Поляна" премия',
+    ],
+    "📚 出版动态": [
+        "издательство АСТ новинки книги",
+        "издательство Эксмо новые книги",
+        '"Азбука" издательство новинки',
+        "книжные новинки недели литература',
+    ],
 }
 
-# ========== 3. 文学关键词（只保留标题沾边的）==========
-KEYWORDS = ["литератур", "книг", "поэт", "поэз", "проза", "писател",
-            "роман", "рассказ", "повест", "премия", "издат", "автор",
-            "читател", "библиотек", "перевод", "стих", "букер"]
+def gnews_url(query):
+    """把搜索词变成 Google 新闻 RSS 地址，when:7d = 只搜最近7天"""
+    return ("https://news.google.com/rss/search?q="
+            + quote(query + " when:7d")
+            + "&hl=ru&gl=RU&ceid=RU:ru")
 
-LOOKBACK_DAYS = 7
-BEIJING = timezone(timedelta(hours=8))  # 北京时间
+def norm(title):
+    """标题标准化，用于去重"""
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", title.lower())).strip()
 
-# ========== 4. 抓取并筛选新闻 ==========
-def fetch_news():
-    items, seen = [], set()
-    for source, url in FEEDS.items():
-        try:
-            feed = feedparser.parse(url)
-        except Exception as e:
-            print(f"[警告] {source} 抓取失败：{e}")
-            continue
-        for entry in feed.entries:
-            title = entry.get("title", "").strip()
-            link = entry.get("link", "").strip()
-            if not title or not link or link in seen:
+# ========== 3. 抓取 ==========
+def fetch_all():
+    seen, result = set(), {}
+    for section, queries in SECTIONS.items():
+        result[section] = []
+        for q in queries:
+            try:
+                resp = requests.get(gnews_url(q), timeout=20, headers=HEADERS)
+                print(f"[诊断] {section} |「{q}」状态码 {resp.status_code}")
+                feed = feedparser.parse(resp.content)
+                print(f"        解析出 {len(feed.entries)} 条")
+            except Exception as e:
+                print(f"[警告]「{q}」抓取失败：{e}")
                 continue
-            seen.add(link)
-            # 只保留文学相关标题
-            if not any(k in title.lower() for k in KEYWORDS):
-                continue
-            # 只保留最近7天
-            published = None
-            for key in ("published_parsed", "updated_parsed"):
-                if entry.get(key):
-                    published = datetime(*entry[key][:6], tzinfo=timezone.utc)
+            for e in feed.entries:
+                title = e.get("title", "").strip()
+                link = e.get("link", "").strip()
+                if not title or not link or norm(title) in seen:
+                    continue
+                seen.add(norm(title))
+                # 发布日期
+                published = None
+                for key in ("published_parsed", "updated_parsed"):
+                    if e.get(key):
+                        published = datetime(*e[key][:6], tzinfo=timezone.utc)
+                        break
+                if published is None:
+                    published = datetime.now(timezone.utc)
+                date_str = published.astimezone(BEIJING).strftime("%m月%d日")
+                # 报道这条新闻的媒体名（如俄新社、塔斯社）
+                src = ""
+                if e.get("source"):
+                    src = e["source"].get("title", "")
+                result[section].append({
+                    "date": date_str, "title": title, "link": link, "media": src,
+                })
+                if len(result[section]) >= MAX_PER_SECTION:
                     break
-            if published is None:
-                published = datetime.now(timezone.utc)
-            if datetime.now(timezone.utc) - published > timedelta(days=LOOKBACK_DAYS):
-                continue
-            items.append({
-                "source": source,
-                "title": title,
-                "link": link,
-                "date": published.astimezone(BEIJING).strftime("%m月%d日"),
-            })
-    items.sort(key=lambda x: x["date"])
-    return items
+    return result
 
-# ========== 5. 生成邮件 ==========
-def build_email(items):
+# ========== 4. 生成邮件 ==========
+def build_email(result):
     today = datetime.now(BEIJING)
     week_start = (today - timedelta(days=7)).strftime("%m月%d日")
     week_end = today.strftime("%m月%d日")
 
-    if not items:
-        body = "<p>本周没有找到匹配的文学新闻（可能是新闻源暂时不可用）。</p>"
-    else:
+    parts = []
+    total = 0
+    for section, items in result.items():
+        if not items:
+            parts.append(f"<h3>{section}</h3><p style='color:#999'>本周暂无动态</p>")
+            continue
+        total += len(items)
         rows = "".join(
             f'<tr><td style="color:#888;white-space:nowrap">{i["date"]}</td>'
-            f'<td>[{i["source"]}] <a href="{i["link"]}">{i["title"]}</a></td></tr>'
+            f'<td><a href="{i["link"]}">{i["title"]}</a>'
+            + (f' <span style="color:#bbb;font-size:12px">· {i["media"]}</span>' if i["media"] else "")
+            + "</td></tr>"
             for i in items
         )
-        body = f"""
-        <h2>📚 上周俄罗斯文学动态（{week_start}–{week_end}）</h2>
-        <p>共筛选出 {len(items)} 条文学相关新闻，点击标题查看原文：</p>
-        <table cellpadding="6">{rows}</table>
-        <hr>
-        <p style="color:#aaa;font-size:12px">由 russian-lit-weekly 自动生成</p>
-        """
+        parts.append(f"<h3>{section}</h3><table cellpadding='6'>{rows}</table>")
 
+    body = f"""
+    <h2>📚 上周俄罗斯文学动态（{week_start}–{week_end}）</h2>
+    <p>共 {total} 条，点击标题查看原文：</p>
+    {''.join(parts)}
+    <hr>
+    <p style="color:#aaa;font-size:12px">由 russian-lit-weekly 自动生成 · 信源：Google 新闻聚合</p>
+    """
     msg = MIMEText(body, "html", "utf-8")
     msg["Subject"] = Header(f"📚 俄罗斯文学动态（{week_start}–{week_end}）", "utf-8")
     msg["From"] = formataddr((str(Header("文学小助手", "utf-8")), EMAIL_USER))
     msg["To"] = EMAIL_TO
     return msg
 
-# ========== 6. 发送邮件 ==========
+# ========== 5. 发送 ==========
 def send_email(msg):
     with smtplib.SMTP_SSL("smtp.163.com", 465) as server:
         server.login(EMAIL_USER, EMAIL_PASSWORD)
         server.sendmail(EMAIL_USER, [EMAIL_TO], msg.as_string())
 
-# ========== 主程序入口 ==========
+# ========== 主程序 ==========
 if __name__ == "__main__":
-    print("开始抓取俄罗斯文学新闻…")
-    items = fetch_news()
-    print(f"筛选出 {len(items)} 条")
-    send_email(build_email(items))
+    print("开始抓取俄罗斯文学动态…")
+    result = fetch_all()
+    for section, items in result.items():
+        print(f"[结果] {section}：{len(items)} 条")
+    send_email(build_email(result))
     print("邮件已发送！")
