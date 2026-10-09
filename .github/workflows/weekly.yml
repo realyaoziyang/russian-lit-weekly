@@ -20,7 +20,7 @@ jobs:
 
       # 第三步：安装脚本需要的工具包
       - name: 安装依赖
-        run: pip install feedparser
+        run: pip install feedparser requests
 
       # 第四步：运行脚本（邮箱信息从加密保险箱读取）
       - name: 生成并发送简报
