@@ -1,0 +1,31 @@
+name: 每周俄罗斯文学简报
+
+on:
+  schedule:
+    # UTC时间周日23:00 = 北京时间周一早上7点
+    - cron: '0 23 * * 0'
+  workflow_dispatch:  # 允许手动点击"立即运行"按钮测试
+
+jobs:
+  send-report:
+    runs-on: ubuntu-latest
+    steps:
+      # 第一步：把仓库代码下载到云服务器
+      - uses: actions/checkout@v4
+
+      # 第二步：安装 Python 环境
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # 第三步：安装脚本需要的工具包
+      - name: 安装依赖
+        run: pip install feedparser
+
+      # 第四步：运行脚本（邮箱信息从加密保险箱读取）
+      - name: 生成并发送简报
+        run: python report.py
+        env:
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
